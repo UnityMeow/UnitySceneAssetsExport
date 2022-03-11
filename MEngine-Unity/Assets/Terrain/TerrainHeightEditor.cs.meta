@@ -1,0 +1,17 @@
+fileFormatVersion: 2
+guid: 8271f3077c76b5f4696ebad6987e777e
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - quadMesh: {instanceID: 0}
+  - heightmapShader: {instanceID: 0}
+  - componentObj: {instanceID: 0}
+  - texExp: {instanceID: 0}
+  - testHeight: {instanceID: 0}
+  - layerCS: {fileID: 7200000, guid: 79ee2ff48e03a8948900b0008a375217, type: 3}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

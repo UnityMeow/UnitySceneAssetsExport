@@ -1,0 +1,325 @@
+﻿//#pragma kernel SkyOccSet
+#pragma kernel CellReLight
+#pragma kernel ProbeSampleCompute
+#pragma kernel CellIndirectReLight
+#pragma kernel ProbeSampleCompute INDIRECT
+#pragma kernel BufferInjectToTextureMip0
+#pragma kernel BufferInjectToTextureMip1
+#pragma kernel BufferInjectToTextureMip2
+#pragma kernel BufferInjectToTextureMip3
+#pragma kernel SDFCullDataBufferToTex
+/*
+#pragma kernel GenerateTex3DMip
+#pragma kernel TextureMip1ToMip0
+#pragma kernel TextureMip2ToMip0
+#pragma kernel TextureMip3ToMip0
+#pragma kernel CopyTex3D
+*/
+#include "ProbeGI.cginc"
+#include "SH.cginc"
+#include "Plane.cginc"
+#include "Montcalo_Library.hlsl"
+#include "SDF.cginc"
+#define Float32MaxValue  3.40282347E+37f
+#define Float32MinValue  -3.40282347E+37f
+float3 _CubeStartPos;
+float3 _CubeSize;
+float3 _SDFPrimitiveResolution;
+uint _Count;
+
+StructuredBuffer<CellData> _SRV_InputCellGeometry;
+RWStructuredBuffer<float3> _UAV_OutputCellColor;
+Texture2D<float> _ShadowMap; SamplerState sampler_ShadowMap;
+float4x4 _ShadowVP;
+float4 _SunLightColor;
+float4 _SunLightDir;
+float3 _OriginPos;
+[numthreads(64, 1, 1)]
+void CellReLight(uint id : SV_DISPATCHTHREADID)
+{
+	if (id >= _Count) return;
+	CellData data = _SRV_InputCellGeometry[id];
+	float3 color = _SunLightColor * data.albedo;
+	float3 worldPos = data.position + _SunLightDir * 0.2 + _OriginPos;
+	float4 shadowProjPos = mul(_ShadowVP, float4(worldPos, 1));
+	shadowProjPos /= shadowProjPos.w;
+	shadowProjPos.y *= -1;
+	float2 shadowUV = shadowProjPos.xy * 0.5 + 0.5;
+	float shadowAtten = (_ShadowMap.SampleLevel(sampler_ShadowMap, shadowUV, 0) < shadowProjPos.z) ? 1 : 0;	
+	float3 colorResult = _SunLightColor * shadowAtten * dot(_SunLightDir, normalize(data.normal)) * data.albedo;
+	_UAV_OutputCellColor[id] = max(2e-3, colorResult);//SHColorDivide(shColor, 6);
+}
+
+Texture3D _SRV_SurfelSHTex0; SamplerState sampler_SRV_SurfelSHTex0;
+Texture3D _SRV_SurfelSHTex1;
+Texture3D _SRV_SurfelSHTex2;
+Texture3D _SRV_SurfelSHTex3;
+Texture3D _SRV_SurfelSHTex4;
+Texture3D _SRV_SurfelSHTex5;
+Texture3D _SRV_SurfelSHTex6;
+
+StructuredBuffer<SDFPrimitive> _SRV_PrimitiveBuffer;
+Texture3D<uint4> _SRV_SDFPrimitiveIndices;
+StructuredBuffer<SH9Color> _SRV_SHResultBuffer;
+RWStructuredBuffer<SH9Color> _UAV_SHResultBuffer;
+float3 _VoxelResolution;
+float3 _SDFUVOffsetIntensity;
+[numthreads(64, 1, 1)]
+void CellIndirectReLight(uint id : SV_DISPATCHTHREADID)
+{
+	if(id >= _Count) return;
+	CellData data = _SRV_InputCellGeometry[id];
+	float3 uv = saturate((data.position - _CubeStartPos) / _CubeSize);
+	uint3 sdfCoord = uv * floor(_SDFPrimitiveResolution);
+	/*
+	float3 GetOffsetForce(
+	uint4 indices_Int,
+	StructuredBuffer<SDFPrimitive> primitives,
+	float3 worldPos,
+	float targetDist)
+	*/
+	float3 offsetForce = GetOffsetForce(
+	_SRV_SDFPrimitiveIndices[sdfCoord],
+	_SRV_PrimitiveBuffer,
+	data.position,
+	_SDFUVOffsetIntensity
+	);
+	Texture3D shTexs[7] = 
+	{
+		_SRV_SurfelSHTex0,
+		_SRV_SurfelSHTex1,
+		_SRV_SurfelSHTex2,
+		_SRV_SurfelSHTex3,
+		_SRV_SurfelSHTex4,
+		_SRV_SurfelSHTex5,
+		_SRV_SurfelSHTex6
+	};
+	float3 uvOffset = offsetForce / _CubeSize;
+	float3 probeUVBase = (floor(uv * floor(_VoxelResolution)) + 0.5);
+	float3 targetProbeUv = (uv + uvOffset) * floor(_VoxelResolution);
+	targetProbeUv = clamp(targetProbeUv,probeUVBase - 1, probeUVBase + 1);
+	targetProbeUv /= floor(_VoxelResolution);
+	SH9Color shColor = GetSHColorFromTexture(shTexs, sampler_SRV_SurfelSHTex0, targetProbeUv);
+	float3 color = 0;
+	SH9 normCosSH = SHCosineLobe(data.normal);
+	for(uint i = 0; i < 9; ++i)
+	{
+		color += normCosSH.c[i] * shColor.c[i] * data.albedo;
+	}
+	_UAV_OutputCellColor[id] = max(2e-3, color * PI);
+}
+StructuredBuffer<int> _SurfelIndices;
+StructuredBuffer<float3> _SRV_InputCellColor;
+groupshared SH9Color shColors[256];
+[numthreads(256, 1, 1)]
+void ProbeSampleCompute(uint groupID : SV_GROUPID, uint threadID : SV_GROUPTHREADID)
+{
+	SH9Color shValue = SHColorSet(0);
+	const uint ITERATE_RATE = SURFEL_COUNT / 256;
+	float rateValue = PI / (float)ITERATE_RATE;
+	uint offset = threadID * ITERATE_RATE;
+	[loop]
+	for(uint i = 0; i < ITERATE_RATE; ++i)
+	{
+		uint ite = i + offset;
+		int index = _SurfelIndices[groupID * SURFEL_COUNT + ite];
+		float3 sampleDir = normalize(UniformSampleSphere(Hammersley(ite, SURFEL_COUNT)).xyz);
+		if (index >= 0)
+		{
+			
+			shValue = SHColorAdd(shValue, GetSHSampleColor(
+			sampleDir, 16, _SRV_InputCellColor[index] * rateValue
+			));
+		}
+		else
+		{
+			#ifndef INDIRECT
+				//TODO
+				//Read Skybox
+				shValue = SHColorAdd(shValue, GetSHSampleColor(
+				sampleDir, 16, 1 * rateValue
+				));
+			#endif
+		}
+	}
+	shColors[threadID] = shValue;
+	uint threadCount = 256 / 2;
+	[loop]
+	while(threadCount != 0)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		if(threadID < threadCount)
+		{
+			shValue = SHColorLerp(
+			shColors[threadID * 2],
+			shColors[threadID * 2 + 1],
+			0.5
+			);
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if(threadID < threadCount)
+		{
+			shColors[threadID] = shValue;
+		}
+		threadCount /= 2;
+	}
+
+	if(threadID == 0)
+	{
+		/*RWTexture3D<float4> surfelTexs[7] = 
+		{
+			_SurfelSHTex0,
+			_SurfelSHTex1,
+			_SurfelSHTex2,
+			_SurfelSHTex3,
+			_SurfelSHTex4,
+			_SurfelSHTex5,
+			_SurfelSHTex6
+		};*/
+		/*Texture3D shTexs[7] = 
+		{
+			_SRV_SurfelSHTex0,
+			_SRV_SurfelSHTex1,
+			_SRV_SurfelSHTex2,
+			_SRV_SurfelSHTex3,
+			_SRV_SurfelSHTex4,
+			_SRV_SurfelSHTex5,
+			_SRV_SurfelSHTex6
+		};*/
+		
+		
+		#ifdef INDIRECT
+			SH9Color outputValue = _UAV_SHResultBuffer[groupID];
+			_UAV_SHResultBuffer[groupID] = SHColorAdd(outputValue, shValue);
+			//SetSHColorAddToTexture(surfelTexs, shTexs, groupID, shValue);
+		#else
+			_UAV_SHResultBuffer[groupID] = shValue;
+			//SetSHColorToTexture(surfelTexs, groupID, shValue);
+		#endif
+		
+	}
+
+}
+
+RWTexture3D<float4> _SurfelSHTex0;
+RWTexture3D<float4> _SurfelSHTex1;
+RWTexture3D<float4> _SurfelSHTex2;
+RWTexture3D<float4> _SurfelSHTex3;
+RWTexture3D<float4> _SurfelSHTex4;
+RWTexture3D<float4> _SurfelSHTex5;
+RWTexture3D<float4> _SurfelSHTex6;
+uint _Mip0BufferCount;		//1 spv   spv: sample per voxel
+uint _Mip1BufferCount;		//1/8 spv
+uint _Mip2BufferCount;		//1/64 spv
+StructuredBuffer<uint> _VoxelIndexBuffer;
+[numthreads(64, 1, 1)]
+void BufferInjectToTextureMip0(uint id : SV_DISPATCHTHREADID)
+{
+	if(id >= _Mip0BufferCount) return;
+	uint voxelValue = _VoxelIndexBuffer[id];
+	uint3 voxelID = GetUInt3FromUInt(voxelValue);
+	RWTexture3D<float4> surfelTexs[7] = 
+	{
+		_SurfelSHTex0,
+		_SurfelSHTex1,
+		_SurfelSHTex2,
+		_SurfelSHTex3,
+		_SurfelSHTex4,
+		_SurfelSHTex5,
+		_SurfelSHTex6
+	};
+	uint3 res = _VoxelResolution;
+	SetSHColorToTexture(surfelTexs, voxelID, _SRV_SHResultBuffer[id]);
+}
+groupshared SH9Color mip1GroupData[8];
+groupshared uint3 mip1GroupVoxelID[8];
+[numthreads(8, 8, 1)]
+void BufferInjectToTextureMip1(uint2 threadID : SV_GROUPTHREADID, uint groupID : SV_GROUPID)
+{
+	uint localID = threadID.y;
+	uint groupLocalID = threadID.x;
+	uint sampleID = groupID * 8 + threadID.x + _Mip0BufferCount;
+	bool kernelAvaliable = sampleID < _Mip1BufferCount;
+	if(kernelAvaliable && localID == 0)
+	{
+		mip1GroupData[groupLocalID] = _SRV_SHResultBuffer[sampleID];
+		mip1GroupVoxelID[groupLocalID] = GetUInt3FromUInt(_VoxelIndexBuffer[sampleID]);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if(kernelAvaliable)
+	{
+		const SH9Color localValue = mip1GroupData[groupLocalID];
+		const uint3 voxelID = mip1GroupVoxelID[groupLocalID];
+		uint3 voxelOffset;
+		voxelOffset.z = localID / 4;
+		uint lefted = localID - voxelOffset.z * 4;
+		voxelOffset.y = lefted / 2;
+		voxelOffset.x = lefted - voxelOffset.y * 2;
+		RWTexture3D<float4> surfelTexs[7] = 
+		{
+			_SurfelSHTex0,
+			_SurfelSHTex1,
+			_SurfelSHTex2,
+			_SurfelSHTex3,
+			_SurfelSHTex4,
+			_SurfelSHTex5,
+			_SurfelSHTex6
+		};
+		SetSHColorToTexture(surfelTexs, voxelOffset + voxelID, localValue);
+	}
+}
+groupshared SH9Color mip2GroupColor[1];
+groupshared uint3 mip2GroupID[1];
+[numthreads(4, 4, 4)]
+void BufferInjectToTextureMip2(uint groupID : SV_GROUPID, uint3 threadID : SV_GROUPTHREADID)
+{
+	if(all(threadID == 0))
+	{
+		groupID += _Mip1BufferCount;
+		mip2GroupColor[0] = _SRV_SHResultBuffer[groupID];
+		mip2GroupID[0] = GetUInt3FromUInt(_VoxelIndexBuffer[groupID]);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	RWTexture3D<float4> surfelTexs[7] = 
+	{
+		_SurfelSHTex0,
+		_SurfelSHTex1,
+		_SurfelSHTex2,
+		_SurfelSHTex3,
+		_SurfelSHTex4,
+		_SurfelSHTex5,
+		_SurfelSHTex6
+	};
+	SetSHColorToTexture(surfelTexs, mip2GroupID[0] + threadID, mip2GroupColor[0]);
+}
+[numthreads(8, 8, 8)]
+void BufferInjectToTextureMip3(uint groupID : SV_GROUPID, uint3 threadID : SV_GROUPTHREADID)
+{
+	if(all(threadID == 0))
+	{
+		groupID += _Mip2BufferCount;
+		mip2GroupColor[0] = _SRV_SHResultBuffer[groupID];
+		mip2GroupID[0] = GetUInt3FromUInt(_VoxelIndexBuffer[groupID]);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	RWTexture3D<float4> surfelTexs[7] = 
+	{
+		_SurfelSHTex0,
+		_SurfelSHTex1,
+		_SurfelSHTex2,
+		_SurfelSHTex3,
+		_SurfelSHTex4,
+		_SurfelSHTex5,
+		_SurfelSHTex6
+	};
+	SetSHColorToTexture(surfelTexs, mip2GroupID[0] + threadID, mip2GroupColor[0]);
+}
+RWTexture3D<uint4> _UAV_SDFPrimitiveIndices;
+StructuredBuffer<uint4> _SDFPrimitiveBuffer;
+[numthreads(4, 4, 4)]
+void SDFCullDataBufferToTex(uint3 id : SV_DISPATCHTHREADID)
+{
+	uint3 res = (uint3)_SDFPrimitiveResolution;
+	uint indices = id.x + id.y * res.x + id.z * res.x * res.y;
+	_UAV_SDFPrimitiveIndices[id] = _SDFPrimitiveBuffer[indices];
+}

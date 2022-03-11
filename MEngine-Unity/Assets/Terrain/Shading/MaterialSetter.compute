@@ -1,0 +1,138 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel Printer 
+
+RWTexture2D<float4> _SplatTex;
+RWTexture2D<float4> _IndexTex;
+uint _CurrentIndex;
+RWTexture2D<float> _PrintedTex;
+float4 _PointsUV;
+uint _Operator;
+uint _Resolution;
+float _Radius;
+//0: average
+//1: center
+
+void SetIndex(uint2 id, float value, uint channel)
+{
+    float4 obj = _IndexTex[id];
+    switch(channel)
+    {
+        case 0:
+        obj.x = value;
+        break;
+        case 1:
+        obj.y = value;
+        break;
+        case 2:
+        obj.z = value;
+        break;
+        case 3:
+        obj.w = value;
+        break;
+    }
+    _IndexTex[id] = obj;
+}
+
+inline uint GetChannel(uint2 id)
+{
+    float4 splat = _IndexTex[id];
+    float curIndex = _CurrentIndex / 255.0;
+    [unroll]
+    for(uint i = 0; i < 4; ++i)
+    {
+        if(splat[i] > 0.999)
+        {
+            return i;
+        }
+        else if(abs(splat[i] - curIndex) < 0.001)
+        {
+            return i;
+        }
+    }
+    float4 weight = _SplatTex[id];
+    float minV = weight[0];
+    uint minIndex = 0;
+    [unroll]
+    for(uint j = 1; j < 4; ++j)
+    {
+        if(weight[j] < minV)
+        {
+            minV = weight[j];
+            minIndex = j;
+        }
+    }
+    SetIndex(id, curIndex, minIndex);
+    return minIndex;
+}
+
+inline void BlendWithOthers(uint channel, uint2 id)
+{
+    float4 splat = _SplatTex[id];
+    float value = _PrintedTex[id];
+    [unroll]
+    for(uint i = 0; i < 4; ++i)
+    {
+        if(i == channel)
+        {
+            splat[i] = value;
+        }
+        else
+        {
+            splat[i] *= (1 - value);
+        }
+    }
+    _SplatTex[id] = splat;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint2 id : SV_DispatchThreadID)
+{
+    uint targetChannel = GetChannel(id);
+    BlendWithOthers(targetChannel, id);
+}
+struct Ray
+{
+    float2 start;
+    float2 end;
+    float2 direction;
+    float len;
+};
+
+float GetPointToRayDistance(Ray r, float2 uv)
+{
+    float2 pToStart = uv - r.start;
+    float signedEdge = dot(r.direction, pToStart);
+    float2 pToRay = (uv - (r.start + r.direction * signedEdge));
+    float dist = length(pToRay);
+    pToRay = normalize(pToRay);
+    float toPointLen = min(length(pToStart), length(uv - r.end));
+    float outAngle = dot(normalize(pToStart), normalize(uv - r.end));
+    float insideAngle = min(dot(pToRay, normalize(pToStart)), dot(pToRay, normalize(uv - r.end)));
+    float isInPlane = outAngle < insideAngle;
+    return isInPlane ? dist : toPointLen;
+}
+
+[numthreads(8,8,1)]
+void Printer(uint2 id : SV_DISPATCHTHREADID)
+{
+    float2 uv = (id + 0.5) / _Resolution;
+    float currentWeight = 0;
+    Ray r;
+    r.start = _PointsUV.xy;
+    r.end = _PointsUV.zw;
+    float2 dir = r.end - r.start;
+    r.direction = normalize(dir);
+    r.len = length(dir);
+    float dist = GetPointToRayDistance(r, uv);
+    switch(_Operator)
+    {
+        case 0:
+        currentWeight = dist < _Radius;
+        break;
+        case 1:
+        currentWeight = 1 - saturate(dist / _Radius);
+        break;
+    }
+    _PrintedTex[id] = max(_PrintedTex[id], currentWeight);
+}

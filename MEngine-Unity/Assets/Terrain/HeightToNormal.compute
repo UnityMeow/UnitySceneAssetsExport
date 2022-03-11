@@ -1,0 +1,56 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel HeightToNormal
+#pragma kernel DownSample
+
+Texture2D<float> _Heightmap;
+RWTexture2D<float3> _OutputNormal;
+float4 _TexelSize;
+float _HeightScale;
+
+SamplerState Global_point_clamp_sampler, Global_bilinear_clamp_sampler, Global_trilinear_clamp_sampler, Global_point_repeat_sampler, Global_bilinear_repeat_sampler, Global_trilinear_repeat_sampler;
+
+[numthreads(8,8,1)]
+void HeightToNormal (uint2 id : SV_DispatchThreadID)
+{
+    uint2 originID = id;
+    id = (id == 0) ? id + 1 : id;
+    id = (id > (_TexelSize.xy - 1.5)) ? id - 1 : id;
+    float2 uv = (id + 0.5) / _TexelSize.xy;
+    float2 pixelSize = 1.0 / _TexelSize.xy;
+    float tl = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(-1, -1), 0) * _HeightScale;// (this[u - 1, v - 1]);
+    float l = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(-1, 0), 0) * _HeightScale;//(this[u - 1, v]);
+    float bl = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(-1, 1), 0) * _HeightScale;// (this[u - 1, v + 1]);
+    float b = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(0, 1), 0) * _HeightScale;//(this[u, v + 1]);
+    float br = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(1, 1), 0) * _HeightScale;//(this[u + 1, v + 1]);
+    float r = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(1, 0), 0) * _HeightScale;//(this[u + 1, v]);
+    float tr = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(1, -1), 0) * _HeightScale;//(this[u + 1, v - 1]);
+    float t = _Heightmap.SampleLevel(Global_point_clamp_sampler, uv + pixelSize * float2(0, -1), 0) * _HeightScale;//(this[u, v - 1]);
+    // Compute dx using Sobel:
+            //           -1 0 1 
+            //           -2 0 2
+            //           -1 0 1
+    float dX = tr + 2 * r + br - tl - 2 * l - bl;
+
+            // Compute dy using Sobel:
+            //           -1 -2 -1 
+            //            0  0  0
+            //            1  2  1
+    float dY = bl + 2 * b + br - tl - 2 * t - tr;
+    dX = -dX;
+    float dZ = 1;
+    _OutputNormal[originID] = saturate(normalize(float3(dX, dY, dZ)) * 0.5 + 0.5);
+}
+Texture2D<float4> _SourceTex;
+RWTexture2D<float4> _DestTex;
+[numthreads(8,8,1)]
+void DownSample(uint2 id : SV_DISPATCHTHREADID)
+{
+
+        float4 value = 
+        _SourceTex[id * 2] * 0.25 + 
+        _SourceTex[id * 2 + uint2(1, 0)] * 0.25 + 
+        _SourceTex[id * 2 + uint2(1, 1)] * 0.25 + 
+        _SourceTex[id * 2 + uint2(0, 1)] * 0.25;
+        _DestTex[id] = value;
+    
+}

@@ -1,0 +1,92 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel TexCopy
+#pragma kernel IntTexCopy UINT_INPUT
+#pragma kernel IntTexCopy UINT2_INPUT
+#pragma kernel IntTexCopy UINT4_INPUT
+#pragma kernel CubemapToTex
+#pragma kernel TexCopyNormal
+#pragma kernel Tex3DCopy
+
+#include "UnityCG.cginc"
+
+TextureCube<float4> _MainTex; SamplerState sampler_MainTex;
+Texture2D<float4> _MainTex2D;SamplerState sampler_MainTex2D;
+uint _Count;
+uint _TargetMipLevel;
+RWStructuredBuffer<float4> _ResultBuffer;
+
+Texture2D<uint> _UIntTexture;
+Texture2D<uint2> _UInt2Texture;
+Texture2D<uint4> _UInt4Texture;
+
+RWStructuredBuffer<uint> _ResultInt1Buffer;
+RWStructuredBuffer<uint2> _ResultInt2Buffer;
+RWStructuredBuffer<uint4> _ResultInt4Buffer;
+RWTexture2D<float4> _DestTex;
+Texture3D<float4> _VoxelTex;
+float4 _Directions[4];
+[numthreads(8,8,1)]
+void CSMain (uint2 id : SV_DispatchThreadID)
+{
+    if(any(id >= _Count)) return;
+    float2 uv = (id + 0.5) / _Count;
+    float3 left = lerp(_Directions[0].xyz, _Directions[2].xyz, uv.y);
+    float3 right = lerp(_Directions[1].xyz, _Directions[3].xyz, uv.y);
+    float3 dir = normalize(lerp(left, right, uv.x));
+    _ResultBuffer[id.y * _Count + id.x] = _MainTex.SampleLevel(sampler_MainTex, dir, _TargetMipLevel);
+}
+float4 _TextureSize;
+[numthreads(8, 8, 1)]
+void TexCopy(uint2 id : SV_DISPATCHTHREADID)
+{
+    if(id.x >= _TextureSize.x || id.y >= _TextureSize.y)
+        return;
+    _ResultBuffer[id.y * _Count + id.x] = _MainTex2D.Load(uint3(id.x, id.y,  _TargetMipLevel));
+}
+
+[numthreads(8, 8, 1)]
+void IntTexCopy(uint2 id : SV_DISPATCHTHREADID)
+{
+    if(any(id.xy >= _TextureSize.xy))
+        return;
+    #ifdef UINT_INPUT
+    _ResultInt1Buffer[id.y * _Count + id.x] = _UIntTexture.Load(uint3(id.x, id.y, 0));
+    #endif
+    #ifdef UINT2_INPUT
+    _ResultInt2Buffer[id.y * _Count + id.x] = _UInt2Texture.Load(uint3(id.x, id.y, 0));
+    #endif
+    #ifdef UINT4_INPUT
+    _ResultInt4Buffer[id.y * _Count + id.x] = _UInt4Texture.Load(uint3(id.x, id.y, 0));
+    #endif
+}
+
+[numthreads(8,8,1)]
+void CubemapToTex(uint2 id : SV_DISPATCHTHREADID)
+{
+    if(any(id >= _Count)) return;
+    float2 uv = (id + 0.5) / _Count;
+    float3 left = lerp(_Directions[0].xyz, _Directions[2].xyz, uv.y);
+    float3 right = lerp(_Directions[1].xyz, _Directions[3].xyz, uv.y);
+    float3 dir = normalize(lerp(left, right, uv.x));
+    _DestTex[id] = _MainTex.SampleLevel(sampler_MainTex, dir, _TargetMipLevel);
+}
+
+[numthreads(8, 8, 1)]
+void TexCopyNormal(uint2 id : SV_DISPATCHTHREADID)
+{
+    if(id.x >= _TextureSize.x || id.y >= _TextureSize.y)
+        return;
+    _ResultBuffer[id.y * _Count + id.x] = float4(UnpackNormal(_MainTex2D.Load(uint3(id.x, id.y,  _TargetMipLevel))).xy * 0.5 + 0.5, 0, 0);
+}
+
+[numthreads(4, 4, 4)]
+void Tex3DCopy(uint3 id : SV_DISPATCHTHREADID)
+{
+    uint3 _TextureSizeUInt = (uint3)(_TextureSize.xyz + 0.5);
+    if(any(id >= _TextureSizeUInt)) return;
+    
+        uint index = id.x + _TextureSizeUInt.x * id.y + _TextureSizeUInt.x * _TextureSizeUInt.y * id.z;
+        _ResultBuffer[index] = 1;//_VoxelTex[id];
+    
+}

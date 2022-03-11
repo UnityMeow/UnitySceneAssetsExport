@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: d21c44e7f259b1f4d9471da0eaab42ae
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - albedoTexture: {instanceID: 0}
+  - normalTexture: {instanceID: 0}
+  - smoTexture: {instanceID: 0}
+  - cs: {fileID: 7200000, guid: afd0e27cd704ec846a043790f0ae6d5a, type: 3}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

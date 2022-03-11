@@ -1,0 +1,42 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+float4x4 _DecalMatrix;
+uint _Operator;
+float4 _ScaleOffset;
+Texture2D<float> _HeightTex;
+Texture2D<float> _MaskTex;
+RWTexture2D<float> _MainTex;
+float4 _TexelSize;
+SamplerState Global_point_clamp_sampler, Global_bilinear_clamp_sampler, Global_trilinear_clamp_sampler, Global_point_repeat_sampler, Global_bilinear_repeat_sampler, Global_trilinear_repeat_sampler;
+[numthreads(8,8,1)]
+void CSMain (uint2 id : SV_DispatchThreadID)
+{
+    float2 uv = (id + 0.5) * _TexelSize.xy;
+    float2 xzPos = uv - 0.5;
+    float4 decalPos = mul(_DecalMatrix, float4(xzPos.x, 0, xzPos.y, 1));
+    decalPos /= decalPos.w;
+    float2 decalUV = decalPos.xz + 0.5;
+    if(dot(abs(decalUV - saturate(decalUV)), 1) > 0)
+    {
+        return;
+    }
+    float height = _HeightTex.SampleLevel(Global_point_clamp_sampler, decalUV, 0);
+    float mask = _MaskTex.SampleLevel(Global_point_clamp_sampler, decalUV, 0);
+    height = height * _ScaleOffset.x + _ScaleOffset.y;
+    switch(_Operator)
+    {
+        case 0:
+        _MainTex[id] += height * mask;
+        break;
+        case 1:
+        _MainTex[id] *= lerp(1, height, mask);
+        break;
+        case 2:
+        _MainTex[id] /= lerp(1, height, mask);
+        break;
+        case 3:
+        _MainTex[id] = lerp(_MainTex[id], height, mask);
+        break;
+    }
+}

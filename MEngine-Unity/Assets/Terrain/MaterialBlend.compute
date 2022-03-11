@@ -1,0 +1,81 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel BlendOpaque
+#pragma kernel BlendAdd
+#pragma kernel SplatOpaque
+#pragma kernel SplatAdd
+#pragma kernel PrintNormal
+#include "UnityCG.cginc"
+RWTexture2D<float4> _AlbedoResult;
+RWTexture2D<float2> _NormalResult;
+RWTexture2D<float4> _SMOResult;
+
+Texture2D<float> _SplatTexture;
+Texture2D<float4> _AlbedoTexture;
+Texture2D<float4> _NormalTexture;
+Texture2D<float4> _SMOTexture;
+SamplerState Global_point_clamp_sampler, Global_bilinear_clamp_sampler, Global_trilinear_clamp_sampler, Global_point_repeat_sampler, Global_bilinear_repeat_sampler, Global_trilinear_repeat_sampler;
+uint _Count;
+float2 _TileScale;
+
+[numthreads(16,16,1)]
+void BlendOpaque(uint2 id : SV_DISPATCHTHREADID)
+{
+    if(id.x >= _Count || id.y >= _Count) return;
+    float2 uv = (id + 0.5) / _Count;
+    uv *= _TileScale;
+    _AlbedoResult[id] = _AlbedoTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0);
+    _NormalResult[id] = UnpackNormal(_NormalTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0)).xy;
+    _SMOResult[id] = _SMOTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0);
+}
+
+[numthreads(16,16,1)]
+void BlendAdd (uint2 id : SV_DispatchThreadID)
+{
+    if(id.x >= _Count || id.y >= _Count) return;
+    float2 uv = (id + 0.5) / _Count;
+    float2 splatUV = uv;
+    uv *= _TileScale;
+    float4 albedo = _AlbedoTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0);
+    float2 normal = UnpackNormal(_NormalTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0)).xy;
+    float4 smo = _SMOTexture.SampleLevel(Global_bilinear_repeat_sampler, uv, 0);
+    float splat = _SplatTexture.SampleLevel(Global_bilinear_clamp_sampler, splatUV, 0);
+    _AlbedoResult[id] = lerp(_AlbedoResult[id], albedo, splat);
+    _NormalResult[id] = lerp(_NormalResult[id], normal, splat);
+    _SMOResult[id] = lerp(_SMOResult[id], smo, splat);
+}
+
+RWTexture2D<uint4> _IndexTexResult;
+RWTexture2D<float4> _SplatResult;
+uint _CurrentIndex;
+
+[numthreads(16,16,1)]
+void SplatOpaque(uint2 id : SV_DISPATCHTHREADID)
+{
+    _IndexTexResult[id] = _CurrentIndex;
+    _SplatResult[id] = 1;
+}
+
+[numthreads(16,16,1)]
+void SplatAdd (uint2 id : SV_DispatchThreadID)
+{
+    uint4 prevIndex = _IndexTexResult[id];
+    float4 prevSplat = _SplatResult[id];
+    float2 splatUV = (id + 0.5) / _Count;
+    float splat = _SplatTexture.SampleLevel(Global_bilinear_clamp_sampler, splatUV, 0);
+   // if(splat > 1e-4) //Should Not Be ignored
+    {
+        prevIndex.xyz = prevIndex.yzw;
+        prevSplat.xyz = prevSplat.yzw;
+        prevIndex.w = _CurrentIndex;
+        prevSplat.xyz *= (1 - splat);
+        prevSplat.w = splat;
+        _IndexTexResult[id] = prevIndex;
+        _SplatResult[id] = prevSplat;
+    }
+}
+
+[numthreads(16,16,1)]
+void PrintNormal(uint2 id : SV_DISPATCHTHREADID)
+{
+    _NormalResult[id] = UnpackNormal(_NormalTexture[id]).xy * 0.5 + 0.5;
+}

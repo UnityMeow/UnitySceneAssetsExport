@@ -1,0 +1,152 @@
+﻿#pragma kernel SkyOcclusion_Horizon
+#pragma kernel SkyOcclusion_Verticle
+#pragma kernel SkyOcclusion_Collect
+#pragma kernel Surfel_Tracker
+#pragma kernel ProbePositionOffset
+
+#include "ProbeGI.cginc"
+#include "Montcalo_Library.hlsl"
+#include "SH.cginc"
+#define CUBEMAP_SIZE 512
+
+TextureCube<float> _DepthTex; SamplerState sampler_DepthTex;
+RWStructuredBuffer<SH9> _SampleCache;
+RWStructuredBuffer<SH9> _SampleResults;
+TextureCube<float4> _AlbedoDepthTex; SamplerState sampler_AlbedoDepthTex;
+TextureCube<float3> _NormalTex; SamplerState sampler_NormalTex;
+RWStructuredBuffer<SurfelSampleData> _SurfelSamplesBuffer;
+float3 _CamPos;
+uint _Count;
+
+groupshared SH9 sharedData[CUBEMAP_SIZE];
+
+[numthreads(CUBEMAP_SIZE, 1, 1)]
+void SkyOcclusion_Horizon(uint3 id : SV_DISPATCHTHREADID, uint groupThreadID : SV_GROUPTHREADID)
+{
+    float3 sampleDir = normalize(UniformSampleSphere(Hammersley(id.z * CUBEMAP_SIZE * CUBEMAP_SIZE + id.y * CUBEMAP_SIZE + id.x, CUBEMAP_SIZE*CUBEMAP_SIZE*6)).xyz);
+    SH9 samples = GetSHSample(sampleDir.xyz, 8, _DepthTex, sampler_DepthTex);
+    uint groupThreadCount = CUBEMAP_SIZE / 2;
+    sharedData[groupThreadID] = samples;
+    [loop]
+    while(groupThreadCount > 0)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadID < groupThreadCount)
+        {
+            SH9 firstSample = sharedData[groupThreadID * 2];
+            SH9 secondSample = sharedData[groupThreadID * 2 + 1];
+            samples = SHLerp(firstSample, secondSample, 0.5);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadID < groupThreadCount)
+        {
+            sharedData[groupThreadID] = samples;
+        }
+        groupThreadCount /= 2;
+    }
+    if(groupThreadID == 0)
+    _SampleCache[6 + id.z * CUBEMAP_SIZE + id.y] = samples;
+}
+
+[numthreads(CUBEMAP_SIZE, 1, 1)]
+void SkyOcclusion_Verticle(uint2 id : SV_DISPATCHTHREADID, uint groupThreadID : SV_GROUPTHREADID)
+{
+    uint groupThreadCount = CUBEMAP_SIZE / 2;
+    sharedData[groupThreadID] = _SampleCache[6 + CUBEMAP_SIZE * id.y + groupThreadID];
+    SH9 samples;
+    [loop]
+    while(groupThreadCount > 0)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadID < groupThreadCount)
+        {
+            SH9 firstSample = sharedData[groupThreadID * 2];
+            SH9 secondSample = sharedData[groupThreadID * 2 + 1];
+            samples = SHLerp(firstSample, secondSample, 0.5);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadID < groupThreadCount)
+        {
+            sharedData[groupThreadID] = samples;
+        }
+        groupThreadCount /= 2;
+    }
+    if(groupThreadID == 0)
+    _SampleCache[id.y] = samples;
+}
+
+[numthreads(1,1,1)]
+void SkyOcclusion_Collect()
+{
+    SH9 v = SHSet(0);
+    for(uint i = 0; i < 6; ++i)
+    {
+        v = SHAdd(v,SHDivide(_SampleCache[i], 6));
+    }
+    _SampleResults[_Count] = v;
+}
+
+
+
+[numthreads(64, 1, 1)]
+void Surfel_Tracker(uint id : SV_DISPATCHTHREADID)
+{
+    float3 sampleDir = normalize(UniformSampleSphere(Hammersley(id, SURFEL_COUNT)).xyz);
+    float4 albedoDepth = _AlbedoDepthTex.SampleLevel(sampler_AlbedoDepthTex, sampleDir, 0);
+    SurfelSampleData data = (SurfelSampleData)0;
+    //albedoDepth.w = 0.1;
+    if(albedoDepth.w < 50)
+    {
+        data.avaliable = 1;
+        data.position = _CamPos + sampleDir * albedoDepth.w;
+        data.normal =normalize(_NormalTex.SampleLevel(sampler_NormalTex, sampleDir, 0).xyz * 2 - 1);
+        data.albedo = albedoDepth.xyz;
+    }
+    _SurfelSamplesBuffer[_Count + id] = data;
+}
+
+#include "SDF.cginc"
+float3 _VoxelResolution;
+float3 _CubeStartPos;
+float3 _CubeSize;
+
+StructuredBuffer<SDFPrimitive> _PrimitiveBuffer;
+StructuredBuffer<float4> _SphereBuffer;
+uint _PrimitiveCount;
+uint _SphereCount;
+RWStructuredBuffer<float3> _ProbePos;
+uint _IterateTimes;
+float _TargetDistance;
+RWStructuredBuffer<float> _ProbeDistance;
+[numthreads(4, 4, 4)]
+void ProbePositionOffset(uint3 id : SV_DISPATCHTHREADID)
+{
+    float3 voxelExtent = _CubeSize / _VoxelResolution;
+    float3 worldPos = _CubeStartPos + ((id + 0.5) / _VoxelResolution) * _CubeSize;
+    float3 newWorldPos = worldPos;
+    for(uint i = 0; i < _IterateTimes; ++i)
+    {
+        float dist;
+        
+        float3 normal = CalcSDFNormal(
+        _PrimitiveBuffer, _PrimitiveCount,
+        _SphereBuffer, _SphereCount, newWorldPos, dist
+        );
+        if(dist >= _TargetDistance)
+        {
+            break;
+        }
+        float supposeMoveDistance = (_TargetDistance - dist) * 0.8;
+        newWorldPos += normal * supposeMoveDistance;
+    }
+    float3 diff = newWorldPos - worldPos;
+    diff = clamp(diff, -voxelExtent, voxelExtent);
+    uint3 resInt = (uint3)(_VoxelResolution + 0.5);
+    uint idx = id.x + id.y * resInt.x + id.z * resInt.x * resInt.y;
+    float3 targetPos = worldPos + diff;
+    _ProbePos[idx] = targetPos;
+    _ProbeDistance[idx] = GetDistanceFromArea(
+        _PrimitiveBuffer, _PrimitiveCount,
+        _SphereBuffer, _SphereCount, targetPos);
+
+}
